@@ -3,8 +3,8 @@
 ### Step 1: Clone the Repository
 
 ```bash
-$ git clone https://github.com/ml-cou/python-project.git
-$ cd ml-cou/python-project
+$ git clone https://github.com/ml-cou/Molecule-Prediction.git
+$ cd ml-cou/Molecule-Prediction
 ```
 
 ### Step 2: Install Dependencies

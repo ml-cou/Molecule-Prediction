@@ -9,8 +9,6 @@ $ cd ml-cou/python-project
 
 ### Step 2: Install Dependencies
 
-If your project uses external libraries, install them using pip or another package manager:
-
 ```bash
 $ pip install -r requirements.txt
 ```
@@ -40,7 +38,7 @@ Your_Project_Directory/
 
 
 ### Using a Python Script
-Run project using a Python script (if applicable):
+Run the project using a Python script (if applicable):
 
 ```bash
 $ python main.py

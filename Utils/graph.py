@@ -1,21 +1,37 @@
-import matplotlib.pyplot as plt
+import seaborn as sns
 import pandas as pd
+from matplotlib import pyplot as plt
 
-df=pd.read_excel('../bending-modulus.xlsx')
+# Load the data
+df = pd.read_excel('../temperature.xlsx')
 
-y='Lx_0, nm'
-x_vars=['kappa, kT (q^-4)']
+# Get column names
+column_names = df.columns.tolist()
+y = column_names[0]
+x_vars = column_names[1:]
+
+# Create subplots using Seaborn
 fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
+# Use Seaborn to plot the data
 for x in x_vars:
-    tmp=df.sort_values(by=x)
-    Y=tmp[y]
-    X=tmp[x]
+    tmp = df.sort_values(by=x)
 
-    axes[0].plot(X, Y, linestyle='--', marker='o', label=x)
-    axes[0].legend()
+    # Plot a line plot using Seaborn
+    sns.lineplot(data=tmp, x=y, y=x, ax=axes[0], label=x, linestyle='--', marker='o')
 
-    axes[1].scatter(X,Y,label=x)
-    axes[1].legend()
+    # Plot a scatter plot using Seaborn
+    sns.scatterplot(data=tmp, x=y, y=x, ax=axes[1], label=x)
 
+# Set labels and legends using Seaborn
+axes[0].set_xlabel(y)
+axes[0].set_ylabel("Temperature")
+axes[0].legend()
+
+axes[1].set_xlabel(y)
+axes[1].set_ylabel("Temperature")
+axes[1].legend()
+
+# Show the grid and the plots
+plt.grid()
 plt.show()

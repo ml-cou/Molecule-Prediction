@@ -1,238 +1,220 @@
-import numpy as np
 import pandas as pd
+import torch
+from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader
+import ast
+from torch_geometric.nn import GCNConv, global_mean_pool
+import torch.nn.functional as F
+from torch.nn import Linear
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import numpy as np
+import matplotlib.pyplot as plt
+def encode_atom_features(atom_features, feature_encodings, max_length):
+    encoding = feature_encodings.get(atom_features)
+    if encoding is None:
+        encoding = len(feature_encodings)
+        feature_encodings[atom_features] = encoding
+    return [1 if i == encoding else 0 for i in range(max_length)]
 
-# User-set parameters
-identity_position=[0,1]
-bead_position=[1,1]
-bond_position=[2,1]
-output_directory_node_features='Output/Node_Features'
-output_directory_adjacency='Output/Adjacency_Matrix'
+def remove_quotes_around_brackets(s):
+    s = s.strip()
+    if s.startswith('"[') and s.endswith(']"'):
+        return s[1:-1]
+    return s
 
-# Import data
-lipid_information=pd.read_table('Python-Input.txt',delimiter='\t',header=None)
-atom_identity_input=pd.read_table('bead_info-3.txt',delimiter='\t',header=None)
+# Function to process each row of the dataset
+def process_row(row, feature_encodings, max_length):
+    # Debugging: Print the strings to be evaluated
+    try:
+        node_features_str = ast.literal_eval(row['node_features'])
+        edges_str = ast.literal_eval(row['edge'])
+    except ValueError as e:
+        # Handle the error or re-raise with more information
+        print("Error processing row:", row)
+        raise ValueError(f"Error parsing literals: {e}")
+    target = float(row['kappa, kT (q^-4)'])
 
-input_array=lipid_information.to_numpy()
-bead_identities=atom_identity_input.to_numpy()
+    node_features = [encode_atom_features(atom_feature, feature_encodings, max_length) for atom_feature in node_features_str]
+    x = torch.tensor(node_features, dtype=torch.float)
 
+    edge_index = []
+    for edge_str in edges_str:
+        if isinstance(edge_str, tuple) and len(edge_str) == 2:
+            start_atom, end_atom = edge_str
+        else:
+            raise ValueError(f"Invalid edge format: {edge_str}")
 
-#Create nested list for each Lipid
-list_index=0
-lipids=[]
-addme=[]
-for element in input_array:
-    element=element.tolist()
-    addme.append(element)
-    if element[0] == 'BONDS':
-        list_index+=1
-        lipids.append(addme)
-        addme=[]
+        start_indices = [i for i, atom_feature in enumerate(node_features_str) if atom_feature[0] == start_atom]
+        end_indices = [i for i, atom_feature in enumerate(node_features_str) if atom_feature[0] == end_atom]
+        for start in start_indices:
+            for end in end_indices:
+                edge_index.extend([[start, end], [end, start]])
+    edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
 
+    return Data(x=x, edge_index=edge_index, y=torch.tensor([target], dtype=torch.float))
 
-#print(lipids)
-#print(atom_identity_input)
-#print(bead_identities[0])
-#print(bead_identities[0][2])
+# Load and preprocess the dataset
+df = pd.read_csv('moleculesEDited.csv')
+feature_encodings = {}
+max_length = sum(1 for _, row in df.iterrows() for _ in ast.literal_eval(row['node_features']))
+data_list = [process_row(row, feature_encodings, max_length) for _, row in df.iterrows()]
 
+# Split the dataset
+train_data, test_data = train_test_split(data_list, test_size=0.2, random_state=42)
+train_loader = DataLoader(train_data, batch_size=32, shuffle=True)
+test_loader = DataLoader(test_data, batch_size=32, shuffle=False)
 
-# Find latest indecies of tails starting
-def latest_tail_index(lipids):
-    latest_A_start=0
-    latest_B_start=0
+# Define the GCN model
+class GCN(torch.nn.Module):
+    def __init__(self, input_channels, hidden_channels):
+        super(GCN, self).__init__()
+        self.conv1 = GCNConv(input_channels, hidden_channels)
+        self.conv2 = GCNConv(hidden_channels, hidden_channels)
+        self.out = Linear(hidden_channels, 1)
 
-    # Split node identites into separate elements
-    for lipid in lipids:
+    def forward(self, data):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.relu(self.conv2(x, edge_index))
+        x = global_mean_pool(x, batch)
+        return self.out(x)
 
-        nodes=str(lipid[1][1]).split(' ')
+# Model, optimizer, and criterion
+model = GCN(input_channels=max_length, hidden_channels=16)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+criterion = torch.nn.MSELoss()
+def train():
+    model.train()
+    total_loss = 0
+    y_real = []
+    y_pred = []
+    for data in train_loader:
+        optimizer.zero_grad()
+        output = model(data)
+        loss = criterion(output, data.y.view(-1, 1))
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+        y_real.extend(data.y.view(-1).tolist())
+        y_pred.extend(output.view(-1).tolist())
+    r2 = r2_score(y_real, y_pred)
+    return total_loss / len(train_loader), r2
 
-        # If ending element is empty, remove it.
-        if nodes[-1]=='':
-            nodes=nodes[:-1]
+def test(loader):
+    model.eval()
+    y_real = []
+    y_pred = []
+    with torch.no_grad():
+        for data in loader:
+            output = model(data)
+            y_real.extend(data.y.view(-1).tolist())
+            y_pred.extend(output.view(-1).tolist())
+    mae = mean_absolute_error(y_real, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_real, y_pred))
+    r2 = r2_score(y_real, y_pred)
+    return mae, rmse, r2, y_real, y_pred
+# Training loop with R² score tracking
+train_r2_scores = []
+test_r2_scores = []
 
-        # Enumerate through nodes, if a tail starts later than the latest current recorded one, replace that one with the new enumeration number
-        for enum,node in enumerate(nodes):
-            if '1A' in node and enum>latest_A_start:
-                latest_A_start=enum
+for epoch in range(200):
+    train_loss, train_r2 = train()
+    mae, rmse, test_r2, _, _ = test(test_loader)
+    train_r2_scores.append(train_r2)
+    test_r2_scores.append(test_r2)
+    print(f'Epoch: {epoch}, Train Loss: {train_loss:.4f}, Train R²: {train_r2:.4f}, Test MAE: {mae:.4f}, Test RMSE: {rmse:.4f}, Test R²: {test_r2:.4f}')
 
-            if '1B' in node and enum>latest_B_start:
-                latest_B_start=enum
+# Plot R² scores
+plt.figure(figsize=(12, 6))
+plt.plot(train_r2_scores, label='Train R²')
+plt.plot(test_r2_scores, label='Test R²')
+plt.xlabel('Epoch')
+plt.ylabel('R² Score')
+plt.title('Train and Test R² Scores Over Epochs')
+plt.legend()
+plt.show()
 
-    return(latest_A_start,latest_B_start)
+# Function to process a new molecule
+def process_new_molecule(new_molecule, feature_encodings, max_length):
+    return process_row(new_molecule, feature_encodings, max_length)
 
+# Function to predict for a new molecule
+def predict_new_molecule(new_molecule_data):
+    model.eval()
+    predictions = []
+    with torch.no_grad():
+        for data in new_molecule_data:
+            output = model(data)
+            predictions.append(output.view(-1).tolist())
+    return predictions
 
-# Find longest tail lengths
-def longest_tail_length(lipids):
-    longest_A_length=0
-    longest_B_length=0
-    count_longest = 0
-    for lipid in lipids:
-        count_A=0
-        count_B=0
-
-        nodes = str(lipid[1][1]).split(' ')
-
-        # If ending element is empty, remove it.
-        if nodes[-1] == '':
-            nodes = nodes[:-1]
-
-        # Iterate through nodes, increasing the count of nodes in A and B tails when found.
-        for enum,node in enumerate(nodes):
-            if node[-1]=='A':
-                count_A+=1
-
-            if node[-1]=='B':
-                count_B+=1
-
-            if enum>count_longest:
-                count_longest=enum
-
-        # If count of current lipids tail length is longer than existing, replace it.
-        if count_A>longest_A_length:
-            longest_A_length=count_A
-
-        if count_B>longest_B_length:
-            longest_B_length=count_B
-
-    return (longest_A_length,longest_B_length,count_longest)
-
-
-# Find the unique beads present in atom_identity_input
-def find_unique_beads(bead_information):
-    bead_types=[]
-
-    for line in bead_information:
-
-        if line[1] not in bead_types:
-            bead_types.append(line[1])
-
-    # print(bead_types)
-    return(bead_types)
-
-
-# Generate 1-hot node feature matrix and write it.
-def node_features(lipid,bead_types,bead_identities,start_A,start_B,longest_lipid):
-    # Function input data processing
-    #print(lipid)
-    identity=lipid[identity_position[0]][identity_position[1]]
-    if identity[-1]==' ':
-        identity=identity[:-1]
-
-    nodes=lipid[bead_position[0]][bead_position[1]]
-    nodes=nodes.split(' ')
-    if nodes[-1]=='':
-        nodes=nodes[:-1]
-
-    #print(nodes)
-
-    node_matrix=np.zeros((longest_lipid,len(bead_types))) #Zero array length of longest lipid , by number of bead types.
-
-    # Generation of row(Bead identity) and column headers (Bead types)
-    column_headers=[]
-    for bead_type in bead_types:
-        column_headers.append(bead_type)
-
-    row_headers=np.zeros(longest_lipid)
-    row_headers=list(row_headers)
-
-
-    current_index=0
-    #print(identity)
-    # Find the start index of the lipid in bead_identites
-    for enum,bead in enumerate(bead_identities):
-        if bead[3]==identity:
-            lipid_bead_identity_start=enum
-            break
-
-    #Iterate through each node, and manipulate the node feature matrix for a given nodes bead type.
-    for node in nodes:
-        #print(node)
-        if '1A' in node:
-            current_index=start_A
-
-        if '1B' in node:
-            current_index=start_B
-
-        for bead in bead_identities[lipid_bead_identity_start:]:
-            if bead[4]==node and bead[3]==identity:
-                bead_type=bead[1]
-                #print(bead_type)
-
-        row_headers[current_index]=node
-        node_matrix[current_index][bead_types.index(bead_type)]=1
-
-        current_index+=1
-
-    # Replace all 0 elements in row_headers with -
-    while 0.0 in row_headers:
-        row_headers[row_headers.index(0.0)]='-'
-
-    #print(node_matrix)
-
-    # Create pandas dataframe
-    node_DF=pd.DataFrame(node_matrix)
-    node_DF.columns=column_headers
-    node_DF.index=row_headers
-
-    #print(node_DF)
-
-    write_me('Node',identity,node_DF)
-
-    return(row_headers)
+df = pd.read_csv('moleculesEDited.csv')
 
 
-def adjacency_matrix(lipid,nodes):
-    # Bond data pre-processing
-    bonds=lipid[bond_position[0]][bond_position[1]]
-    identity = lipid[identity_position[0]][identity_position[1]]
-    bonds=bonds.split(' ')
-    if bonds[-1]=='':
-        bonds=bonds[:-1]
-
-    adjacency_array=np.zeros((len(nodes),len(nodes)))  #Adjacency matrix generation
-    # Update adjacency matrix using each bond.
-    for bond in bonds:
-        bonded_beads=bond.split('-')
-        bead_1_index=nodes.index(bonded_beads[0])
-        bead_2_index=nodes.index(bonded_beads[1])
-
-        adjacency_array[bead_1_index][bead_2_index] = 1
-        adjacency_array[bead_2_index][bead_1_index] = 1
-
-    # Dataframe generation and writing
-    print(len(nodes),len(adjacency_array[0]))
-    adjacency_dataframe=pd.DataFrame(adjacency_array)
-    adjacency_dataframe.columns=nodes
-    adjacency_dataframe.index=nodes
-
-    #print(adjacency_dataframe)
-    write_me('Adjacency',identity,adjacency_dataframe)
+# Function to clean tuples by removing white spaces
+def clean_tuples(tuples_list):
+    return [(item[0].strip(), item[1].strip()) for item in tuples_list]
 
 
-def write_me(type,identity,data):
-    if type=='Adjacency': data.to_csv(f'{output_directory_adjacency}/{identity}.txt',sep='\t')
-    if type=='Node': data.to_csv(f'{output_directory_node_features}/{identity}.txt',sep='\t')
+# Function to get molecule data for a given lipid
+def get_molecule_data(lipid_name):
+    filtered_df = df[
+        df["Lipid composition (molar)"].str.contains(fr'\b{lipid_name}\b', regex=True, case=False, na=False)]
 
+    if filtered_df.empty:
+        return f"No data found for lipid: {lipid_name}"
 
-#Find the latest start positions for each tail, and the longest tails.
-latest_A,latest_B=latest_tail_index(lipids)
-longest_A,longest_B,longest_lipid=longest_tail_length(lipids)
-bead_types=find_unique_beads(bead_identities) #Find the unique bead types in the bead identities.
-# print(latest_A,latest_B)
-#print(longest_A,longest_B,longest_lipid)
+    lipid_data = filtered_df.iloc[0]
 
-# Standardized start positions for tails and head groups.
-start_A=latest_A
+    # Clean the node_features and edge data
+    node_features = clean_tuples(ast.literal_eval(lipid_data['node_features']))
+    edge = clean_tuples(ast.literal_eval(lipid_data['edge']))
 
-# Manipulate start positions and longest lipid length based on tail lengths.
-if start_A+longest_A>latest_B:
-    start_B=start_A+longest_A
+    # Convert to string without additional quotes
+    node_features_str = str(node_features)
+    edge_str = str(edge)
+
+    molecule_data = {
+        'node_features': node_features_str,
+        'edge': edge_str,
+        'kappa, kT (q^-4)': 0  # This field is taken as is from the dataframe
+    }
+    return molecule_data
+
+pressed=int(input("Press 1 for individual composition and Press 2 for mixed composition : "))
+if pressed == 2:
+    lipid_name = input(" Please enter the 1st lipid composition (molar) : ")
+    percentage = float(input("Enter the percentage of the lipid"))
+    lipid_name2 = input(" Please enter the 2nd lipid composition (molar) : ")
+    percentage2 = float(input("Enter the percentage of the lipid"))
+    molecule_data = get_molecule_data(lipid_name)
+    molecule_data2 = get_molecule_data(lipid_name2)
+
+    processed_POPC = process_new_molecule(molecule_data, feature_encodings, max_length)
+    processed_POPE = process_new_molecule(molecule_data2, feature_encodings, max_length)
+
+    prediction_POPC = predict_new_molecule(DataLoader([processed_POPC], batch_size=1))
+    prediction_POPE = predict_new_molecule(DataLoader([processed_POPE], batch_size=1))
+    if isinstance(molecule_data, str):
+        print(molecule_data)
+        print(molecule_data2)
+    else:
+        print(f"{lipid_name} = {molecule_data}")
+        print(f"{lipid_name2} = {molecule_data2}")
+
+    combined_prediction = (percentage/100) * prediction_POPC[0][0] + (percentage2/100)  * prediction_POPE[0][0]
+    print("Combined Prediction for",percentage,'% ',lipid_name,"and" ,percentage2," %",lipid_name2, " : ", combined_prediction)
+
 else:
-    start_B=latest_B
+    lipid_name = input(" Please enter the lipid composition (molar) : ")
+    molecule_data = get_molecule_data(lipid_name)
+    if isinstance(molecule_data, str):
+        print(molecule_data)
+    else:
+        print(f"{lipid_name} = {molecule_data}")
+    processed_new_molecule = process_new_molecule(molecule_data, feature_encodings, max_length)
+    new_molecule_loader = DataLoader([processed_new_molecule], batch_size=1)
+    predictions = predict_new_molecule(new_molecule_loader)
+    print("individual prediction for POPC",predictions)
 
-if start_B+longest_B>longest_lipid:
-    longest_lipid=start_B+longest_B
-
-# Generate and write the node and adjacency matricies for each lipid.
-for lipid in lipids:
-    nodes=node_features(lipid,bead_types,bead_identities,start_A,start_B,longest_lipid)
-    adjacency_matrix(lipid,nodes)
